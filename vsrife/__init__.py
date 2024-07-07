@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import time
 import math
 import os
+import cv2
 import warnings
 from fractions import Fraction
 from threading import Lock
@@ -9,7 +11,12 @@ from threading import Lock
 import numpy as np
 import torch
 import torch.nn.functional as F
-import vapoursynth as vs
+from tqdm.auto import tqdm
+import skvideo.io
+import _thread
+from queue import Queue, Empty
+from ssim import ssim_matlab
+# import vapoursynth as vs
 
 __version__ = "5.2.0"
 
@@ -57,28 +64,29 @@ models_str = models_str[:-2]
 
 @torch.inference_mode()
 def rife(
-    clip: vs.VideoNode,
+    clip: str = "/content/drive/MyDrive/cosmicYT/alchemymagic_100.mp4",
     device_index: int = 0,
     num_streams: int = 2,
-    model: str = "4.15.lite",
-    factor_num: int = 2,
-    factor_den: int = 1,
+    model: str = "4.15",
+    use_fp16: bool = False,
+    factor_num: int = 6,
+    factor_den: int = 2,
     fps_num: int | None = None,
     fps_den: int | None = None,
     scale: float = 1.0,
     ensemble: bool = False,
     sc: bool = True,
     sc_threshold: float | None = None,
-    trt: bool = False,
+    trt: bool = True,
     trt_debug: bool = False,
     trt_min_shape: list[int] = [128, 128],
-    trt_opt_shape: list[int] = [1920, 1080],
-    trt_max_shape: list[int] = [1920, 1080],
+    trt_opt_shape: list[int] = [960, 540],
+    trt_max_shape: list[int] = [3840, 2160],
     trt_workspace_size: int = 0,
     trt_max_aux_streams: int | None = None,
     trt_optimization_level: int | None = None,
     trt_cache_dir: str = model_dir,
-) -> vs.VideoNode:
+) -> str:
     """Real-Time Intermediate Flow Estimation for Video Frame Interpolation
 
     :param clip:                    Clip to process. Only RGBH and RGBS formats are supported.
@@ -116,63 +124,97 @@ def rife(
                                     first time. Note each engine is created for specific settings such as model
                                     path/name, precision, workspace etc, and specific GPUs and it's not portable.
     """
-    if not isinstance(clip, vs.VideoNode):
-        raise vs.Error("rife: this is not a clip")
+    print(f'''
+    RUNNING WITH THE FOLLOWING PARAMS:
+    clip = {clip}
+    device_index = {device_index}
+    num_streams = {num_streams}
+    model = {model}
+    use_fp16 = {use_fp16}
+    factor_num = {factor_num}
+    factor_den = {factor_den}
+    fps_num = {fps_num}
+    fps_den = {fps_den}
+    scale = {scale}
+    ensemble = {ensemble}
+    sc = {sc}
+    sc_threshold = {sc_threshold}
+    trt = {trt}
+    trt_debug = {trt_debug}
+    trt_min_shape = {trt_min_shape}
+    trt_opt_shape = {trt_opt_shape}
+    trt_max_shape = {trt_max_shape}
+    trt_workspace_size = {trt_workspace_size}
+    trt_max_aux_streams = {trt_max_aux_streams}
+    trt_optimization_level = {trt_optimization_level}
+    trt_cache_dir = {trt_cache_dir}
+    ''')
+    cap = cv2.VideoCapture(clip)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
 
-    if clip.format.id not in [vs.RGBH, vs.RGBS]:
-        raise vs.Error("rife: only RGBH and RGBS formats are supported")
 
-    if clip.num_frames < 2:
-        raise vs.Error("rife: clip's number of frames must be at least 2")
+    if frame_count < 2:
+        raise ValueError("rife: clip's number of frames must be at least 2")
 
     if not torch.cuda.is_available():
-        raise vs.Error("rife: CUDA is not available")
+        raise RuntimeError("rife: CUDA is not available")
 
     if num_streams < 1:
-        raise vs.Error("rife: num_streams must be at least 1")
+        raise ValueError("rife: num_streams must be at least 1")
 
     if model not in models:
-        raise vs.Error(f"rife: model must be {models_str}")
+        raise ValueError(f"rife: model must be {models_str}")
 
     if factor_num < 1:
-        raise vs.Error("rife: factor_num must be at least 1")
+        raise ValueError("rife: factor_num must be at least 1")
 
     if factor_den < 1:
-        raise vs.Error("rife: factor_den must be at least 1")
+        raise ValueError("rife: factor_den must be at least 1")
 
     if fps_num is not None and fps_num < 1:
-        raise vs.Error("rife: fps_num must be at least 1")
+        raise ValueError("rife: fps_num must be at least 1")
 
     if fps_den is not None and fps_den < 1:
-        raise vs.Error("rife: fps_den must be at least 1")
+        raise ValueError("rife: fps_den must be at least 1")
 
-    if fps_num is not None and fps_den is not None and clip.fps == 0:
-        raise vs.Error("rife: clip does not have a valid frame rate and hence fps_num and fps_den cannot be used")
+    if fps_num is not None and fps_den is not None and fps == 0:
+        raise ValueError("rife: clip does not have a valid frame rate and hence fps_num and fps_den cannot be used")
 
     if scale not in [0.25, 0.5, 1.0, 2.0, 4.0]:
-        raise vs.Error("rife: scale must be 0.25, 0.5, 1.0, 2.0, or 4.0")
+        raise ValueError("rife: scale must be 0.25, 0.5, 1.0, 2.0, or 4.0")
 
     if not isinstance(trt_min_shape, list) or len(trt_min_shape) != 2:
-        raise vs.Error("rife: trt_min_shape must be a list with 2 items")
+        raise TypeError("rife: trt_min_shape must be a list with 2 items")
 
     if not isinstance(trt_opt_shape, list) or len(trt_opt_shape) != 2:
-        raise vs.Error("rife: trt_opt_shape must be a list with 2 items")
+        raise TypeError("rife: trt_opt_shape must be a list with 2 items")
 
     if not isinstance(trt_max_shape, list) or len(trt_max_shape) != 2:
-        raise vs.Error("rife: trt_max_shape must be a list with 2 items")
+        raise TypeError("rife: trt_max_shape must be a list with 2 items")
 
     if any(trt_min_shape[i] >= trt_max_shape[i] for i in range(2)):
-        raise vs.Error("rife: trt_min_shape must be less than trt_max_shape")
+        raise ValueError("rife: trt_min_shape must be less than trt_max_shape")
 
     if os.path.getsize(os.path.join(model_dir, "flownet_v4.0.pkl")) == 0:
-        raise vs.Error("rife: model files have not been downloaded. run 'python -m vsrife' first")
+        raise FileNotFoundError("rife: model files have not been downloaded. run 'python -m vsrife' first")
+
 
     torch.set_float32_matmul_precision("high")
 
-    fp16 = clip.format.bits_per_sample == 16
+    fp16 = use_fp16
     dtype = torch.half if fp16 else torch.float
 
     device = torch.device("cuda", device_index)
+
+    torch.set_grad_enabled(False)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.benchmark = True
+        if(use_fp16):
+            torch.set_default_tensor_type(torch.cuda.HalfTensor)
 
     stream = [torch.cuda.Stream(device=device) for _ in range(num_streams)]
     stream_lock = [Lock() for _ in range(num_streams)]
@@ -240,11 +282,11 @@ def rife(
         flownet.half()
 
     if fps_num is not None and fps_den is not None:
-        factor = Fraction(fps_num, fps_den) / clip.fps
+        factor = Fraction(fps_num, fps_den) / fps
         factor_num, factor_den = factor.as_integer_ratio()
 
-    w = clip.width
-    h = clip.height
+    w = width
+    h = height
     tmp = max(32, int(32 / scale))
     pw = math.ceil(w / tmp) * tmp
     ph = math.ceil(h / tmp) * tmp
@@ -256,8 +298,8 @@ def rife(
     tenVertical = torch.linspace(-1.0, 1.0, ph, dtype=dtype, device=device).view(1, 1, ph, 1).expand(-1, -1, -1, pw)
     backwarp_tenGrid = torch.cat([tenHorizontal, tenVertical], 1)
 
-    if sc_threshold is not None:
-        clip = sc_detect(clip, sc_threshold)
+    # if sc_threshold is not None:
+    #     clip = sc_detect(cv2.VideoCapture(clip), sc_threshold)
 
     if trt:
         import tensorrt
@@ -370,15 +412,24 @@ def rife(
             torch_tensorrt.save(flownet, trt_engine_path, output_format="torchscript", inputs=example_tensors)
 
         flownet = [torch.jit.load(trt_engine_path).eval() for _ in range(num_streams)]
+        print('loaded TRT')
 
     index = -1
     index_lock = Lock()
 
-    @torch.inference_mode()
-    def inference(n: int, f: list[vs.VideoFrame]) -> vs.VideoFrame:
-        remainder = n * factor_den % factor_num
+    def pad_image(img):
+        if(use_fp16):
+            return F.pad(img, padding).half()
+        else:
+            return F.pad(img, padding)
 
-        if remainder == 0 or (sc and f[0].props.get("_SceneChangeNext")):
+    @torch.inference_mode()
+    def inference(n: int, interp_target: int, f: list[torch.Tensor]) -> np.ndarray:
+        remainder = interp_target - n
+        # print(f'REMAINDER: {remainder}')
+
+        if remainder == 0:
+            # print('returning f')
             return f[0]
 
         nonlocal index
@@ -387,53 +438,198 @@ def rife(
             local_index = index
 
         with stream_lock[local_index], torch.cuda.stream(stream[local_index]):
-            img0 = frame_to_tensor(f[0], device)
-            img1 = frame_to_tensor(f[1], device)
-            img0 = F.pad(img0, padding)
-            img1 = F.pad(img1, padding)
+            # img0 = frame_to_tensor(f[0], device)
+            # img1 = frame_to_tensor(f[1], device)
+            img0 = f[0]
+            img1 = f[1]
+            # img0 = img0.permute(0, 3, 1, 2)  # Swap height and width dimensions
+            # img1 = img1.permute(0, 3, 1, 2)
+
+            # img0 = F.pad(img0, padding)
+            # img1 = F.pad(img1, padding)
 
             timestep = torch.full((1, 1, ph, pw), remainder / factor_num, dtype=dtype, device=device)
+            # print("img0 shape:", img0.shape)
+            # print("img1 shape:", img1.shape)
+            # print("timestep shape:", timestep.shape)
+            # print("tenFlow_div shape:", tenFlow_div.shape)
+            # print("backwarp_tenGrid shape:", backwarp_tenGrid.shape)
+
 
             if trt:
+                # print('interpolating with trt')
                 output = flownet[local_index](img0, img1, timestep, tenFlow_div, backwarp_tenGrid)
             else:
                 output = flownet(img0, img1, timestep, tenFlow_div, backwarp_tenGrid)
+            # print('successfully interpolated image')
+            output = output[:, :, :h, :w]
+            return output
+            # return tensor_to_frame(output[:, :, :h, :w])
 
-            return tensor_to_frame(output[:, :, :h, :w], f[0].copy())
+    clip_name = os.path.splitext(clip)[0]
+    clip_output_path = os.path.join(os.path.dirname(clip), clip_name + "_output_clip.mp4")
 
-    clip0 = vs.core.std.Interleave([clip] * factor_num)
-    if factor_den > 1:
-        clip0 = clip0.std.SelectEvery(cycle=factor_den, offsets=0)
+    outputfps = fps * (factor_num / factor_den)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(clip_output_path, fourcc, outputfps, (width, height))
 
-    clip1 = clip.std.DuplicateFrames(frames=clip.num_frames - 1).std.Trim(first=1)
-    clip1 = vs.core.std.Interleave([clip1] * factor_num)
-    if factor_den > 1:
-        clip1 = clip1.std.SelectEvery(cycle=factor_den, offsets=0)
+    videogen = skvideo.io.vreader(clip)
+    lastframe = next(videogen)
 
-    return clip0.std.FrameEval(lambda n: clip0.std.ModifyFrame([clip0, clip1], inference), clip_src=[clip0, clip1])
+    # Initialize the first frame
+    ret, first_frame = cap.read()# Assuming frame_number starts from 0
+
+    use_png = False
+    def clear_write_buffer(use_png, write_buffer):
+        cnt = 0
+        while True:
+            item = write_buffer.get()
+            if item is None:
+                break
+            if use_png:
+                cv2.imwrite('vid_out/{:0>7d}.png'.format(cnt), item[:, :, ::-1])
+                cnt += 1
+            else:
+                writer.write(item[:, :, ::-1])
+
+    use_montage = False
+    def build_read_buffer(use_montage, read_buffer, videogen):
+        try:
+            for frame in videogen:
+                # if not user_args.img is None:
+                #     frame = cv2.imread(os.path.join(user_args.img, frame), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
+                if use_montage:
+                    frame = frame[:, left: left + w]
+                read_buffer.put(frame)
+        except:
+            pass
+        read_buffer.put(None)
+
+    write_buffer = Queue(maxsize=500)
+    read_buffer = Queue(maxsize=500)
+    _thread.start_new_thread(build_read_buffer, (use_png, read_buffer, videogen))
+    _thread.start_new_thread(clear_write_buffer, (use_montage, write_buffer))
+
+    # writer.write(first_frame)
+    write_buffer.put(first_frame)
+    pbar = tqdm(total=frame_count, desc="Interpolating")
+    frame_number = 0
+
+    frame1 = torch.from_numpy(np.transpose(lastframe, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+    frame1 = pad_image(frame1)
+    temp = None
+    times_to_interpolate = int(factor_num / factor_den)
+    
+    while True:
+        start_time = time.time()
+        if temp is not None:
+            frame = temp
+            temp = None
+        else:
+            ret, frame = cap.read()
+        if frame is None:
+            break
+        # frame0 = lastframe
+        # frame1 = frame
+        I0 = frame1
+        I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+        I1 = pad_image(I1)
+        I0_small = F.interpolate(I0, (32, 32), mode='bilinear', align_corners=False)
+        I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
+        ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
+
+        break_flag = False
+        frames = []
+        # frames.append(frame0)
+        frames.append(I0)
+
+        if ssim > 0.996:
+            frame = read_buffer.get() # read a new frame
+            if frame is None:
+                break_flag = True
+                frame = lastframe
+            else:
+                temp = frame
+            I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+            I1 = pad_image(I1)
+            # print('INTERPOLATING SSIM > 0.996')
+            # start_time = time.time()
+            I1 = inference(1, 2, [I0, I1])
+            # print(f'interpolated frame in {time.time()-start_time:.9f}')
+            I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
+            ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
+            frame = (I1[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
+            
+        if ssim < 0.2:
+            # output_frames = []
+            for i in range(times_to_interpolate - 1):
+                frames.append(I0)
+            '''
+            output = []
+            step = 1 / args.multi
+            alpha = 0
+            for i in range(args.multi - 1):
+                alpha += step
+                beta = 1-alpha
+                output.append(torch.from_numpy(np.transpose((cv2.addWeighted(frame[:, :, ::-1], alpha, lastframe[:, :, ::-1], beta, 0)[:, :, ::-1].copy()), (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.)
+            '''
+        else:
+            for i in range(times_to_interpolate+1):
+                n = times_to_interpolate
+                # start_time = time.time()
+                processed_frame = inference(i, n, [I0, I1])
+                # print(f'interpolated frame in {time.time()-start_time:.9f}')
+                frames.append(processed_frame)
+                I1 = I0
+                I0 = processed_frame
+                # if frame0.shape == (width, height, 3):
+                #     frame0 = frame0.transpose(2, 0, 1)  # Swap dimensions to (3, 540, 960)
+                #     frame0 = frame0[np.newaxis, :, :, :]
+                # else:
+                #     if frame0.shape[0] == 1:
+                #         frame0 = frame0.squeeze(0)  # Remove the batch dimension only if it's size one
+
+                #     frame0 = frame0.transpose(1, 2, 0)
+                # for j in frames:
+                #     writer.write(j)
+                n-=1
+            # frames.append(frame1)
+        frames.append(I1)
+        # writer.write(lastframe)
+        write_buffer.put(lastframe)
+        for j in frames:
+            j = (((j[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
+            write_buffer.put(j)
+            # writer.write(j)
+        # for mid in processed_frame:
+        #     mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
+        #     write_buffer.put(mid[:h, :w])
+        pbar.update(1)
+        lastframe = frame
+        frame_number += 1
+        # print(f'interpolated loop finished in {time.time()-start_time:.9f}')
+        if break_flag:
+            break
+    # writer.write(lastframe)
+    write_buffer.put(lastframe)
+    writer.release()
+    cap.release()
+    pbar.close()
+
+    return clip_output_path
 
 
-def sc_detect(clip: vs.VideoNode, threshold: float) -> vs.VideoNode:
-    def copy_property(n: int, f: list[vs.VideoFrame]) -> vs.VideoFrame:
-        fout = f[0].copy()
-        fout.props["_SceneChangePrev"] = f[1].props["_SceneChangePrev"]
-        fout.props["_SceneChangeNext"] = f[1].props["_SceneChangeNext"]
-        return fout
+def sc_detect(frame: np.ndarray, threshold: float) -> np.ndarray:
+    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    _, sc_mask = cv2.threshold(gray_frame, threshold, 255, cv2.THRESH_BINARY)
+    return sc_mask
 
-    sc_clip = clip.resize.Bicubic(format=vs.GRAY8, matrix_s="709").misc.SCDetect(threshold)
-    return clip.std.FrameEval(lambda n: clip.std.ModifyFrame([clip, sc_clip], copy_property), clip_src=[clip, sc_clip])
+def frame_to_tensor(frame: np.ndarray, device: torch.device) -> torch.Tensor:
+    frame_normalized = frame.astype(np.float32) / 255.0
+    tensor = torch.from_numpy(frame_normalized).unsqueeze(0).to(device)
+    tensor = tensor.permute(0, 3, 1, 2)
+    return tensor
 
-
-def frame_to_tensor(frame: vs.VideoFrame, device: torch.device) -> torch.Tensor:
-    return (
-        torch.stack([torch.from_numpy(np.asarray(frame[plane])).to(device) for plane in range(frame.format.num_planes)])
-        .unsqueeze(0)
-        .clamp(0.0, 1.0)
-    )
-
-
-def tensor_to_frame(tensor: torch.Tensor, frame: vs.VideoFrame) -> vs.VideoFrame:
-    array = tensor.squeeze(0).detach().cpu().numpy()
-    for plane in range(frame.format.num_planes):
-        np.copyto(np.asarray(frame[plane]), array[plane])
-    return frame
+def tensor_to_frame(tensor: torch.Tensor) -> np.ndarray:
+    frame_normalized = (tensor.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)
+    return frame_normalized

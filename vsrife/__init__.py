@@ -296,7 +296,7 @@ def rife(
         case "4.18":
             from .IFNet_HDv3_v4_18 import IFNet
         case "4.19":
-            from .IFNet_HDv3_v4_18 import IFNet
+            from .IFNet_HDv3_v4_19 import IFNet
 
     model_name = f"flownet_v{model}.pkl"
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import math
 import os
+import gc
 import cv2
 import warnings
 from fractions import Fraction
@@ -59,13 +60,13 @@ models = [
     "4.17",
     "4.17.lite",
     "4.18",
+    "4.19"
 ]
 
 models_str = ""
 for model in models:
     models_str += "'" + model + "', "
 models_str = models_str[:-2]
-
 
 
 def numpy_to_pil_display(np_array):
@@ -81,12 +82,6 @@ def numpy_to_pil_display(np_array):
     # Convert the NumPy array to a PIL Image
     pil_image = Image.fromarray(np_array.astype('uint8'))
 
-    # Display the image using ipywidgets
-    # img_widget = widgets.Image(
-    #     value=pil_image.tobytes(),
-    #     format='png',
-    #     width="256px"
-    # )
     display(pil_image)
 
     return pil_image
@@ -300,6 +295,8 @@ def rife(
             from .IFNet_HDv3_v4_17_lite import IFNet
         case "4.18":
             from .IFNet_HDv3_v4_18 import IFNet
+        case "4.19":
+            from .IFNet_HDv3_v4_18 import IFNet
 
     model_name = f"flownet_v{model}.pkl"
 
@@ -340,6 +337,7 @@ def rife(
     if trt:
         import tensorrt
         import torch_tensorrt
+        print("success trt")
 
         for i in range(2):
             trt_min_shape[i] = math.ceil(max(trt_min_shape[i], 1) / tmp) * tmp
@@ -396,6 +394,9 @@ def rife(
 
             exported_program = torch.export.export(flownet, example_tensors, dynamic_shapes=dynamic_shapes)
 
+            gc.collect()
+            torch.cuda.empty_cache()
+            
             inputs = [
                 torch_tensorrt.Input(
                     min_shape=[1, 3] + trt_min_shape,
@@ -450,6 +451,9 @@ def rife(
         flownet = [torch.jit.load(trt_engine_path).eval() for _ in range(num_streams)]
         print('loaded TRT')
 
+    gc.collect()
+    torch.cuda.empty_cache()
+
     index = -1
     index_lock = Lock()
     
@@ -462,12 +466,6 @@ def rife(
     @torch.inference_mode()
     def inference(n, interp_target, f):
         remainder = interp_target# - n
-        # print(f'REMAINDER: {remainder}')
-
-        # if remainder == 0:
-        #     # print(f"Frame Type is {type(f[0])} and Frame Shape is {f[0].shape}")
-        #     # print('returning f')
-        #     return f[0]
 
         nonlocal index
         with index_lock:
@@ -475,26 +473,12 @@ def rife(
             local_index = index
 
         with stream_lock[local_index], torch.cuda.stream(stream[local_index]):
-            # img0 = frame_to_tensor(f[0], device)
-            # img1 = frame_to_tensor(f[1], device)
             img0 = f[0]
             img1 = f[1]
-            # img0 = img0.permute(0, 3, 1, 2)  # Swap height and width dimensions
-            # img1 = img1.permute(0, 3, 1, 2)
-            # print(f'img0 shape = {img0.shape}')
-            # print(f'img1 shape = {img1.shape}')
-            # img0 = F.pad(img0, padding)
-            # img1 = F.pad(img1, padding)
+
             timestep_divisor = (n+1) * 1. / (interp_target+1)
-            # print(f'TIMESTEP VALUE {timestep_divisor}')
 
             timestep = torch.full((1, 1, ph, pw), timestep_divisor, dtype=dtype, device=device)
-            # print("img0 shape:", img0.shape)
-            # print("img1 shape:", img1.shape)
-            # print("timestep shape:", timestep.shape)
-            # print("tenFlow_div shape:", tenFlow_div.shape)
-            # print("backwarp_tenGrid shape:", backwarp_tenGrid.shape)
-
 
             if trt:
                 # print('interpolating with trt')
@@ -502,9 +486,6 @@ def rife(
             else:
                 output = flownet(img0, img1, timestep, tenFlow_div, backwarp_tenGrid)
 
-            # print(f"Output Type is {type(output)} and Output Shape is {output.shape}")
-            # print('successfully interpolated image')
-            # output = output[:, :, :h, :w]
             return output
             # return tensor_to_frame(output[:, :, :h, :w])
 
@@ -520,9 +501,6 @@ def rife(
     videogen = skvideo.io.vreader(clip)
     lastframe = next(videogen)
     h, w, channels = lastframe.shape
-
-    # Initialize the first frame
-    # ret, first_frame = cap.read()# Assuming frame_number starts from 0
 
     use_png = False
     def clear_write_buffer(use_png, write_buffer):
@@ -556,13 +534,6 @@ def rife(
     _thread.start_new_thread(build_read_buffer, (use_png, read_buffer, videogen))
     _thread.start_new_thread(clear_write_buffer, (use_montage, write_buffer))
 
-    # writer.write(first_frame)
-    # print(f'first frame shape {first_frame.shape}')
-    # _, _, channels = first_frame.shape
-    # write_buffer.put(first_frame)
-
-    # numpy_to_pil_display(first_frame)
-
     frame_number = 0
 
     I1 = torch.from_numpy(np.transpose(np.asarray(lastframe), (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
@@ -572,100 +543,6 @@ def rife(
     times_to_interpolate = int(factor_num / factor_den)
     pbar = tqdm(total=frame_count, desc="Interpolating")
 
-    # while True:
-    #     frames = []
-    #     start_time = time.time()
-    #     if temp is not None:
-    #         frame = temp
-    #         temp = None
-    #     else:
-    #         # ret, frame = cap.read()
-    #         frame = read_buffer.get()
-    #     if frame is None:
-    #         break
-    #     print(f'FRAME INFORMATION: {frame.shape} TYPE: {type(frame)}')
-    #     # frame0 = lastframe
-    #     # frame1 = frame
-    #     I0 = I1
-    #     I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-    #     I1 = pad_image(I1)
-    #     I0_small = F.interpolate(I0, (32, 32), mode='bilinear', align_corners=False)
-    #     I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
-    #     # frame = (I1[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
-    #     ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
-    #     print(f'Potential SSIM === {ssim}')
-    #     ssim = 0.995
-    #     break_flag = False
-    #     # frames.append(frame0)
-    #     # frames.append(I0)
-
-    #     if ssim > 0.996:
-    #         # print(f'using ssm greater than 0.996 on frame {frame_number}')
-    #         frame = read_buffer.get() # read a new frame
-    #         if frame is None:
-    #             break_flag = True
-    #             frame = lastframe
-    #         else:
-    #             temp = frame
-    #         I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-    #         I1 = pad_image(I1)
-    #         # print('INTERPOLATING SSIM > 0.996')
-    #         # start_time = time.time()
-    #         I1 = inference(1, 2, [I0, I1])
-    #         # print(f'interpolated frame in {time.time()-start_time:.9f}')
-    #         I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
-    #         ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
-    #         frame = (I1 * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
-            
-    #     if ssim < 0.2:
-    #         # print(f'using ssim < 0.2 on frame {frame_number}')
-    #         # output_frames = []
-    #         for i in range(times_to_interpolate - 1):
-    #             frames.append(I0)
-    #         '''
-    #         output = []
-    #         step = 1 / args.multi
-    #         alpha = 0
-    #         for i in range(args.multi - 1):
-    #             alpha += step
-    #             beta = 1-alpha
-    #             output.append(torch.from_numpy(np.transpose((cv2.addWeighted(frame[:, :, ::-1], alpha, lastframe[:, :, ::-1], beta, 0)[:, :, ::-1].copy()), (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.)
-    #         '''
-    #     else:
-    #         # print(f'not using ssim on frame {frame_number}')
-    #         for i in range(times_to_interpolate):
-    #             n = times_to_interpolate
-    #             # start_time = time.time()
-    #             processed_frame = inference(i, n, [I0, I1])
-    #             # print(f'interpolated frame in {time.time()-start_time:.9f}')
-    #             frames.append(pad_image(processed_frame))
-    #             # I1 = I0
-    #             # I0 = processed_frame
-    #             # if I0.shape != I1.shape:
-    #             #     I0 = pad_image(I0)
-    #             # if frame0.shape == (width, height, 3):
-    #             #     frame0 = frame0.transpose(2, 0, 1)  # Swap dimensions to (3, 540, 960)
-    #             #     frame0 = frame0[np.newaxis, :, :, :]
-    #             # else:
-    #             #     if frame0.shape[0] == 1:
-    #             #         frame0 = frame0.squeeze(0)  # Remove the batch dimension only if it's size one
-
-    #             #     frame0 = frame0.transpose(1, 2, 0)
-    #             # for j in frames:
-    #             #     writer.write(j)
-    #             n-=1
-    #         # frames.append(frame1)
-    #     # frames.append(I1)
-        
-    #     # writer.write(lastframe)
-    #     print(f'writing frame after loop with length = {len(frames)}')
-    #     print(f'last frame shape {lastframe.shape}')
-    #     write_buffer.put(lastframe)
-    #     for j in frames:
-    #         j = (((j[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w, :channels]))
-    #         print(f'J SHAPE: {j.shape} and TYPE: {type(j)}')
-    #         numpy_to_pil_display(j)
-    #         write_buffer.put(j)
     start = time.time()
 
     while True:
@@ -679,8 +556,6 @@ def rife(
         I0 = I1
         I1 = torch.from_numpy(np.transpose(np.asarray(frame), (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
         I1 = pad_image(I1)
-        # print(f'I0 SHAPE: {I0.shape}')
-        # print(f'I1 SHAPE: {I1.shape}')
         I0_small = F.interpolate(I0, (32, 32), mode='bilinear', align_corners=False)
         I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
         ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
@@ -741,34 +616,26 @@ def rife(
                 n-=1
 
         write_buffer.put(lastframe)
-        # numpy_to_pil_display(lastframe)
+
         for mid in frames:
             mid = np.asarray((((mid[0] * 255.).byte().cpu().numpy().astype(np.uint8).transpose(1, 2, 0))))
-            # numpy_to_pil_display(mid)
-            # print(f'MID SHAPE: {mid.shape} and TYPE: {type(mid)}')
             write_buffer.put(mid[:h, :w])
-            # writer.write(j)
-        # for mid in processed_frame:
-        #     mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
-        #     write_buffer.put(mid[:h, :w])
+
         pbar.update(1)
         lastframe = frame
         frame_number += 1
-        # print(f'interpolated loop finished in {time.time()-start_time:.9f}')
+
         if break_flag:
             break
-    # writer.write(lastframe)
         
-    # print(f'last frame shape  outside of loop === {lastframe.shape}')
     # numpy_to_pil_display(lastframe)
     write_buffer.put(np.asarray(lastframe))
+    write_buffer.put(frame)
 
     while(not write_buffer.empty()):
         time.sleep(0.1)
-
     
     writer.release()
-    # cap.release()
     pbar.close()
 
     end_time = time.time()

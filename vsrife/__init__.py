@@ -61,7 +61,16 @@ models = [
     "4.17",
     "4.17.lite",
     "4.18",
-    "4.19"
+    "4.19",
+    "4.20",
+    "4.21",
+    "4.22",
+    "4.22.lite",
+    "4.23",
+    "4.24",
+    "4.25",
+    "4.25.lite",
+    "4.26",
 ]
 
 models_str = ""
@@ -352,7 +361,7 @@ def rife(
 
     w = width
     h = height
-    tmp = max(32, int(32 / scale))
+    # tmp = max(32, int(32 / scale))
     # pw = math.ceil(w / tmp) * tmp
     # ph = math.ceil(h / tmp) * tmp
     # padding = (0, pw - w, 0, ph - h)

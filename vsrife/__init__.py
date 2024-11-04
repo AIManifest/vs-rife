@@ -24,6 +24,11 @@ import ipywidgets as widgets
 from IPython.display import display
 import matplotlib.pyplot as plt
 # import vapoursynth as vs
+
+def debug_print(print_string, do_print=False):
+    if do_print:
+        print(print_string)
+        
 print('INITIALIZING ENGINE')
 __version__ = "5.2.0"
 
@@ -119,7 +124,7 @@ def rife(
     trt_min_shape: list[int] = [128, 128],
     trt_opt_shape: list[int] = [960, 540],
     trt_max_shape: list[int] = [3840, 2160],
-    trt_static_shape: bool = True,
+    trt_static_shape: bool = False,
     trt_workspace_size: int = 0,
     trt_max_aux_streams: int | None = None,
     trt_optimization_level: int | None = None,
@@ -365,21 +370,17 @@ def rife(
     # pw = math.ceil(w / tmp) * tmp
     # ph = math.ceil(h / tmp) * tmp
     # padding = (0, pw - w, 0, ph - h)
-    # tmp = max(128, int(128 / scale))
-    ph = ((h - 1) // tmp + 1) * tmp
-    pw = ((w - 1) // tmp + 1) * tmp
-    padding = (0, pw - w, 0, ph - h)
+    # # tmp = max(128, int(128 / scale))
+    # ph = ((h - 1) // tmp + 1) * tmp
+    # pw = ((w - 1) // tmp + 1) * tmp
+    # padding = (0, pw - w, 0, ph - h)
 
     tmp = max(modulo, int(modulo / scale))
     pw = math.ceil(w / tmp) * tmp
     ph = math.ceil(h / tmp) * tmp
     padding = (0, pw - w, 0, ph - h)
 
-    tenFlow_div = torch.tensor([(pw - 1.0) / 2.0, (ph - 1.0) / 2.0], dtype=dtype, device=device)
-
-    tenHorizontal = torch.linspace(-1.0, 1.0, pw, dtype=dtype, device=device).view(1, 1, 1, pw).expand(-1, -1, ph, -1)
-    tenVertical = torch.linspace(-1.0, 1.0, ph, dtype=dtype, device=device).view(1, 1, ph, 1).expand(-1, -1, -1, pw)
-    backwarp_tenGrid = torch.cat([tenHorizontal, tenVertical], 1)
+    trt_min_shape = [modulo, modulo]
 
     # if sc_threshold is not None:
     #     clip = sc_detect(cv2.VideoCapture(clip), sc_threshold)
@@ -489,14 +490,14 @@ def rife(
                     ),
                     torch_tensorrt.Input(
                         shape=[2],
-                        dtype=torch.float,
+                        dtype=dtype,
                         name="tenFlow_div",
                     ),
                     torch_tensorrt.Input(
                         min_shape=[1, 2] + trt_min_shape,
                         opt_shape=[1, 2] + trt_opt_shape,
                         max_shape=[1, 2] + trt_max_shape,
-                        dtype=torch.float,
+                        dtype=dtype,
                         name="backwarp_tenGrid",
                     ),
                 ]
@@ -511,18 +512,22 @@ def rife(
                 debug=trt_debug,
                 num_avg_timing_iters=4,
                 workspace_size=trt_workspace_size,
-                min_block_size=1,
+                min_block_size=481,
                 max_aux_streams=trt_max_aux_streams,
                 optimization_level=trt_optimization_level,
+                dryrun=False
             )
 
-            flownet = [flownet.eval() for _ in range(num_streams)]
+            print(f"Flownet Graph: {flownet.graph}")
 
-            # torch_tensorrt.save(flownet, trt_engine_path, output_format="torchscript", inputs=example_inputs)
+            flownet = [flownet.cuda() for _ in range(num_streams)]
+            print("Loaded Compiled TRT Model")
 
-    #     flownet = [torch.jit.load(trt_engine_path).eval() for _ in range(num_streams)]
-    # else:
-    #     flownet = init_module(model_name, IFNet, scale, ensemble, device, dtype)
+        #     torch_tensorrt.save(flownet, trt_engine_path, output_format="torchscript", inputs=example_inputs)
+
+        # flownet = [torch.jit.load(trt_engine_path).eval() for _ in range(num_streams)]
+    else:
+        flownet = init_module(model_name, IFNet, scale, ensemble, device, dtype)
 
     warnings.filterwarnings("ignore", "The given NumPy array is not writable")
 
@@ -531,14 +536,13 @@ def rife(
 
     tenFlow_div = torch.tensor([(pw - 1.0) / 2.0, (ph - 1.0) / 2.0], dtype=torch.float, device=device)
 
-    tenHorizontal = torch.linspace(-1.0, 1.0, pw, dtype=torch.float, device=device)
+    tenHorizontal = torch.linspace(-1.0, 1.0, pw, dtype=dtype, device=device)
     tenHorizontal = tenHorizontal.view(1, 1, 1, pw).expand(-1, -1, ph, -1)
-    tenVertical = torch.linspace(-1.0, 1.0, ph, dtype=torch.float, device=device)
+    tenVertical = torch.linspace(-1.0, 1.0, ph, dtype=dtype, device=device)
     tenVertical = tenVertical.view(1, 1, ph, 1).expand(-1, -1, -1, pw)
     backwarp_tenGrid = torch.cat([tenHorizontal, tenVertical], 1)
 
     torch.cuda.current_stream(device).synchronize()
-    print('loaded TRT')
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -552,38 +556,78 @@ def rife(
         else:
             return F.pad(img, padding)
 
+    # def inference(n, interp_target, f):
+    #     remainder = interp_target# - n
+
+    #     nonlocal index
+    #     with index_lock:
+    #         index = (index + 1) % num_streams
+    #         local_index = index
+
+    #     with stream_lock[local_index], torch.cuda.stream(stream[local_index]):
+    #         img0 = f[0]
+    #         img1 = f[1]
+
+    #         timestep_divisor = (n+1) * 1. / (interp_target+1)
+
+    #         timestep = torch.full((1, 1, ph, pw), timestep_divisor, dtype=dtype, device=device)
+
+    #         if trt:
+    #             # print('interpolating with trt')
+    #             output = flownet[local_index](img0, img1, timestep, tenFlow_div, backwarp_tenGrid)
+    #         else:
+    #             output = flownet(img0, img1, timestep, tenFlow_div, backwarp_tenGrid)
+
+    #         torch.cuda.current_stream(device).synchronize()
+
+    #         return output
+
+    print_anyway = True
     @torch.inference_mode()
     def inference(n, interp_target, f):
-        remainder = interp_target# - n
+        remainder = interp_target
 
+        # if remainder == 0:
+        #     return f[0]
+    
         nonlocal index
         with index_lock:
             index = (index + 1) % num_streams
             local_index = index
-
-        with stream_lock[local_index], torch.cuda.stream(stream[local_index]):
+    
+        with f2t_stream_locks[local_index], torch.cuda.stream(f2t_streams[local_index]):
             img0 = f[0]
             img1 = f[1]
-
-            timestep_divisor = (n+1) * 1. / (interp_target+1)
+    
+            timestep_divisor = (n + 1) * 1.0 / (interp_target + 1)
+            if interp_target == 0:
+                timestep_divisor = 0.5
+            debug_print(f"Timestep Divisor: {timestep_divisor}", print_anyway)
 
             timestep = torch.full((1, 1, ph, pw), timestep_divisor, dtype=dtype, device=device)
 
+            f2t_streams[local_index].synchronize()
+    
+        # Ensure that the current CUDA stream is fully synchronized
+        with inf_stream_locks[local_index], torch.cuda.stream(inf_streams[local_index]):
             if trt:
-                # print('interpolating with trt')
                 output = flownet[local_index](img0, img1, timestep, tenFlow_div, backwarp_tenGrid)
             else:
                 output = flownet(img0, img1, timestep, tenFlow_div, backwarp_tenGrid)
 
-            torch.cuda.current_stream(device).synchronize()
+            inf_streams[local_index].synchronize()
+    
+            # Synchronize the current stream to avoid cross-stream conflicts
+        torch.cuda.current_stream(device).synchronize()
+    
+        return output
 
-            return output
             # return tensor_to_frame(output[:, :, :h, :w])
 
     clip_name = os.path.splitext(clip)[0]
     clip_dir = os.path.dirname(clip)
-    name_length = len([f for f in os.listdir(clip_dir) if os.path.isfile(clip) and clip_name in f])
-    clip_output_path = os.path.join(os.path.dirname(clip), clip_name + f"_{model}_{name_length:03d}_output_clip.mp4")
+    name_length = len([f for f in os.listdir(clip_dir)])
+    clip_output_path = os.path.join(os.path.dirname(clip), clip_name + f"_{model}_{name_length+1:03d}_output_clip.mp4")
 
     outputfps = int(fps * (factor_num / factor_den))
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -651,10 +695,11 @@ def rife(
         I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
         ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
         # print(f'SSIM ==== {ssim}')
+        # ssim = 0.995
 
         break_flag = False
         if ssim > 0.996:
-            print(f'using ssim > 0.996 on frame : {frame_number}')
+            debug_print(f'using ssim > 0.996 on frame : {frame_number}', print_anyway)
             frame = read_buffer.get() # read a new frame
             if frame is None:
                 break_flag = True
@@ -663,13 +708,13 @@ def rife(
                 temp = frame
             I1 = torch.from_numpy(np.transpose(np.asarray(frame), (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
             I1 = pad_image(I1)
-            I1 = inference(1, 2, [I0, I1])
+            I1 = inference(1, 0, [I0, I1])
             I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
-            ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
+            # ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
             frame = (I1[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
             
         if ssim < 0.2:
-            print(f'using ssim< 0.2 on frame : {frame_number}')
+            debug_print(f'using ssim< 0.2 on frame : {frame_number}', print_anyway)
             frames = []
             for i in range(times_to_interpolate - 1):
                 frames.append(I0)
@@ -683,27 +728,13 @@ def rife(
                 output.append(torch.from_numpy(np.transpose((cv2.addWeighted(frame[:, :, ::-1], alpha, lastframe[:, :, ::-1], beta, 0)[:, :, ::-1].copy()), (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.)
             '''
         else:
+            # print(f"Running Pure Interpolation with SSIM: {ssim}")
             frames = []
+            # for i in range(times_to_interpolate-1):
             for i in range(times_to_interpolate-1):
                 n = times_to_interpolate-1
-                # start_time = time.time()
                 processed_frame = inference(i, n, [I0, I1])
-                # print(f'interpolated frame in {time.time()-start_time:.9f}')
                 frames.append(processed_frame)
-                # I1 = I0
-                # I0 = processed_frame
-                # if I0.shape != I1.shape:
-                #     I0 = pad_image(I0)
-                # if frame0.shape == (width, height, 3):
-                #     frame0 = frame0.transpose(2, 0, 1)  # Swap dimensions to (3, 540, 960)
-                #     frame0 = frame0[np.newaxis, :, :, :]
-                # else:
-                #     if frame0.shape[0] == 1:
-                #         frame0 = frame0.squeeze(0)  # Remove the batch dimension only if it's size one
-    
-                #     frame0 = frame0.transpose(1, 2, 0)
-                # for j in frames:
-                #     writer.write(j)
                 n-=1
 
         write_buffer.put(lastframe)
